@@ -1,0 +1,552 @@
+#version 430 core
+
+// 256 threads per workgroup. 24 workgroups (one for each strategy).
+layout(local_size_x = 256) in;
+
+/*
+ * Types and Constants Definitions
+ * Core data structures matching the C++ definitions for warehouse entities.
+ */
+
+const uint kFree = 0;
+const uint kSolid = 1;
+const uint kGap = 2;
+
+struct BayType {
+    int id;
+    float width;
+    float depth;
+    float height;
+    float gap;
+    int nLoads;
+    float price;
+    float _pad;
+};
+
+struct CeilingPoint {
+    float x;
+    float height;
+};
+
+struct PlacedBay {
+    int id;
+    float x;
+    float y;
+    float rotation;
+    float footprintWidth;
+    float footprintDepth;
+    float bayWidth;
+    float bayDepth;
+    float height;
+    float gap;
+    float _pad0;
+    float _pad1;
+};
+
+/*
+ * Input and Output Buffers (SSBOs)
+ * Shader Storage Buffer Objects for passing data between CPU and GPU.
+ */
+
+// 0: Global params
+layout(std430, binding = 0) buffer ParamsBuffer {
+    float minX;
+    float minY;
+    float cellSize;
+    int gridW;
+    int gridH;
+    int numBayTypes;
+    int numCeilingPoints;
+    int maxPlacementsPerStrategy;
+    double freeStartArea;
+} params;
+
+// 1: Bay types
+layout(std430, binding = 1) buffer BayTypesBuffer {
+    BayType bayTypes[];
+};
+
+// 2: Ranked Bay Types per Strategy
+// Size: 24 * numBayTypes
+layout(std430, binding = 2) buffer RankedBayTypesBuffer {
+    int rankedIndices[];
+};
+
+// 3: Ceiling points
+layout(std430, binding = 3) buffer CeilingBuffer {
+    CeilingPoint ceilingPoints[];
+};
+
+// 4: Base Grid (read-only, used to initialize strategy grids)
+// We pack grid cells as uint, but only use lower byte here.
+// But to save space and match C++ vector<uint8_t>, we can pack 4 cells per uint.
+layout(std430, binding = 4) buffer BaseGridBuffer {
+    uint baseGridPacked[];
+};
+
+// 5: Strategy Grids (read-write, each strategy has its own grid)
+layout(std430, binding = 5) buffer StrategyGridsBuffer {
+    uint strategyGridsPacked[];
+};
+
+// 6: Placed Bays (output)
+// Size: 24 * maxPlacementsPerStrategy
+layout(std430, binding = 6) buffer PlacementsBuffer {
+    PlacedBay placements[];
+};
+
+// 7: Strategy Results
+struct StrategyResult {
+    double totalPrice;
+    double totalLoads;
+    double usedArea;
+    double qScore;
+    int placementCount;
+    int _pad0;
+    int _pad1;
+    int _pad2;
+};
+
+layout(std430, binding = 7) buffer ResultsBuffer {
+    StrategyResult results[];
+};
+
+/*
+ * Shared Memory Declarations
+ * Workgroup-local memory for coordinating the strategy evaluation and reductions.
+ */
+shared int sharedSearchFrom;
+shared bool sharedFoundFreeCell;
+shared int sharedGx;
+shared int sharedGy;
+
+shared double sharedBestScore;
+shared int sharedBestTypeIdx;
+shared float sharedBestAngle;
+
+struct OBB {
+    float cx[4];
+    float cy[4];
+};
+
+shared OBB sharedBestSolid;
+shared OBB sharedBestGap;
+shared bool sharedHasGap;
+shared int sharedMaxScore;
+
+/*
+ * Helper Functions
+ * Utility functions for coordinate transformations, grid access, and intersection testing.
+ */
+
+float gridToWorldX(int gx) { return params.minX + float(gx) * params.cellSize; }
+float gridToWorldY(int gy) { return params.minY + float(gy) * params.cellSize; }
+
+uint getGridCell(uint stratId, int gx, int gy) {
+    int idx = gy * params.gridW + gx;
+    int wordIdx = idx / 4;
+    int byteOffset = (idx % 4) * 8;
+    int globalWordIdx = int(stratId) * ((params.gridW * params.gridH + 3) / 4) + wordIdx;
+    uint word = strategyGridsPacked[globalWordIdx];
+    return (word >> byteOffset) & 0xFFu;
+}
+
+void setGridCell(uint stratId, int gx, int gy, uint val) {
+    int idx = gy * params.gridW + gx;
+    int wordIdx = idx / 4;
+    int byteOffset = (idx % 4) * 8;
+    int globalWordIdx = int(stratId) * ((params.gridW * params.gridH + 3) / 4) + wordIdx;
+    
+    // Atomic bitwise operations to update the packed byte safely.
+    uint mask = ~(0xFFu << byteOffset);
+    uint shiftVal = (val & 0xFFu) << byteOffset;
+    atomicAnd(strategyGridsPacked[globalWordIdx], mask);
+    atomicOr(strategyGridsPacked[globalWordIdx], shiftVal);
+}
+
+float ceilingAt(float x) {
+    if (params.numCeilingPoints == 0) return 1e30;
+    for (int i = 0; i < params.numCeilingPoints; ++i) {
+        if (x < ceilingPoints[i].x) {
+            if (i == 0) return 1e30;
+            return ceilingPoints[i - 1].height;
+        }
+    }
+    return ceilingPoints[params.numCeilingPoints - 1].height;
+}
+
+OBB buildOBB(float anchorX, float anchorY, float localW, float localD, float localYOffset, float c, float s) {
+    float lx[4] = float[4](0.0, localW, localW, 0.0);
+    float ly[4] = float[4](localYOffset, localYOffset, localYOffset + localD, localYOffset + localD);
+    OBB obb;
+    for (int i = 0; i < 4; ++i) {
+        obb.cx[i] = anchorX + lx[i] * c - ly[i] * s;
+        obb.cy[i] = anchorY + lx[i] * s + ly[i] * c;
+    }
+    return obb;
+}
+
+bool obbAabbInGrid(OBB o, out int gx0, out int gy0, out int gx1, out int gy1) {
+    float wx0 = o.cx[0], wx1 = o.cx[0];
+    float wy0 = o.cy[0], wy1 = o.cy[0];
+    for (int i = 1; i < 4; ++i) {
+        wx0 = min(wx0, o.cx[i]);
+        wx1 = max(wx1, o.cx[i]);
+        wy0 = min(wy0, o.cy[i]);
+        wy1 = max(wy1, o.cy[i]);
+    }
+    gx0 = int(floor((wx0 - params.minX) / params.cellSize));
+    gy0 = int(floor((wy0 - params.minY) / params.cellSize));
+    gx1 = int(ceil((wx1 - params.minX) / params.cellSize));
+    gy1 = int(ceil((wy1 - params.minY) / params.cellSize));
+    if (gx1 <= 0 || gy1 <= 0 || gx0 >= params.gridW || gy0 >= params.gridH) return false;
+    return true;
+}
+
+bool cellOverlapsOBB(float cx0, float cy0, float cx1, float cy1, OBB obb) {
+    const float kEps = 1e-3;
+    float lo, hi;
+    
+    lo = obb.cx[0]; hi = obb.cx[0];
+    for (int i = 1; i < 4; ++i) { lo = min(lo, obb.cx[i]); hi = max(hi, obb.cx[i]); }
+    if (hi <= cx0 + kEps || lo >= cx1 - kEps) return false;
+    
+    lo = obb.cy[0]; hi = obb.cy[0];
+    for (int i = 1; i < 4; ++i) { lo = min(lo, obb.cy[i]); hi = max(hi, obb.cy[i]); }
+    if (hi <= cy0 + kEps || lo >= cy1 - kEps) return false;
+    
+    float cellX[4] = float[4](cx0, cx1, cx1, cx0);
+    float cellY[4] = float[4](cy0, cy0, cy1, cy1);
+    
+    for (int i = 0; i < 2; ++i) {
+        int j = (i + 1) & 3;
+        float nx = -(obb.cy[j] - obb.cy[i]);
+        float ny =  (obb.cx[j] - obb.cx[i]);
+        float oLo = 1e30, oHi = -1e30;
+        for (int k = 0; k < 4; ++k) {
+            float p = obb.cx[k] * nx + obb.cy[k] * ny;
+            oLo = min(oLo, p); oHi = max(oHi, p);
+        }
+        float cLo = 1e30, cHi = -1e30;
+        for (int k = 0; k < 4; ++k) {
+            float p = cellX[k] * nx + cellY[k] * ny;
+            cLo = min(cLo, p); cHi = max(cHi, p);
+        }
+        if (oHi <= cLo + kEps || cHi <= oLo + kEps) return false;
+    }
+    return true;
+}
+
+bool fitsSolidOBB(uint stratId, OBB obb) {
+    int gx0, gy0, gx1, gy1;
+    if (!obbAabbInGrid(obb, gx0, gy0, gx1, gy1)) return false;
+    if (gx0 < 0 || gy0 < 0 || gx1 > params.gridW || gy1 > params.gridH) return false;
+
+    for (int gy = gy0; gy < gy1; ++gy) {
+        float wy0 = gridToWorldY(gy);
+        float wy1 = wy0 + params.cellSize;
+        for (int gx = gx0; gx < gx1; ++gx) {
+            float wx0 = gridToWorldX(gx);
+            float wx1 = wx0 + params.cellSize;
+            if (!cellOverlapsOBB(wx0, wy0, wx1, wy1, obb)) continue;
+            if (getGridCell(stratId, gx, gy) != kFree) return false;
+        }
+    }
+    return true;
+}
+
+bool fitsGapOBB(uint stratId, OBB obb) {
+    int gx0, gy0, gx1, gy1;
+    if (!obbAabbInGrid(obb, gx0, gy0, gx1, gy1)) return false;
+    if (gx0 < 0 || gy0 < 0 || gx1 > params.gridW || gy1 > params.gridH) return false;
+
+    for (int gy = gy0; gy < gy1; ++gy) {
+        float wy0 = gridToWorldY(gy);
+        float wy1 = wy0 + params.cellSize;
+        for (int gx = gx0; gx < gx1; ++gx) {
+            float wx0 = gridToWorldX(gx);
+            float wx1 = wx0 + params.cellSize;
+            if (!cellOverlapsOBB(wx0, wy0, wx1, wy1, obb)) continue;
+            if (getGridCell(stratId, gx, gy) == kSolid) return false;
+        }
+    }
+    return true;
+}
+
+void markSolidOBB(uint stratId, OBB obb) {
+    int gx0, gy0, gx1, gy1;
+    if (!obbAabbInGrid(obb, gx0, gy0, gx1, gy1)) return;
+    gx0 = max(gx0, 0); gy0 = max(gy0, 0);
+    gx1 = min(gx1, params.gridW); gy1 = min(gy1, params.gridH);
+    for (int gy = gy0; gy < gy1; ++gy) {
+        float wy0 = gridToWorldY(gy);
+        float wy1 = wy0 + params.cellSize;
+        for (int gx = gx0; gx < gx1; ++gx) {
+            float wx0 = gridToWorldX(gx);
+            float wx1 = wx0 + params.cellSize;
+            if (cellOverlapsOBB(wx0, wy0, wx1, wy1, obb)) {
+                setGridCell(stratId, gx, gy, kSolid);
+            }
+        }
+    }
+}
+
+void markGapOBB(uint stratId, OBB obb) {
+    int gx0, gy0, gx1, gy1;
+    if (!obbAabbInGrid(obb, gx0, gy0, gx1, gy1)) return;
+    gx0 = max(gx0, 0); gy0 = max(gy0, 0);
+    gx1 = min(gx1, params.gridW); gy1 = min(gy1, params.gridH);
+    for (int gy = gy0; gy < gy1; ++gy) {
+        float wy0 = gridToWorldY(gy);
+        float wy1 = wy0 + params.cellSize;
+        for (int gx = gx0; gx < gx1; ++gx) {
+            float wx0 = gridToWorldX(gx);
+            float wx1 = wx0 + params.cellSize;
+            if (cellOverlapsOBB(wx0, wy0, wx1, wy1, obb)) {
+                uint c = getGridCell(stratId, gx, gy);
+                if (c == kFree) {
+                    setGridCell(stratId, gx, gy, kGap);
+                }
+            }
+        }
+    }
+}
+
+bool ceilingClearsOBB(OBB obb, float bayHeight) {
+    float wx0 = obb.cx[0], wx1 = obb.cx[0];
+    for (int i = 1; i < 4; ++i) {
+        wx0 = min(wx0, obb.cx[i]);
+        wx1 = max(wx1, obb.cx[i]);
+    }
+    if (wx0 > wx1) { float t = wx0; wx0 = wx1; wx1 = t; }
+    for (float x = wx0; x <= wx1; x += params.cellSize) {
+        if (ceilingAt(x) < bayHeight) return false;
+    }
+    if (ceilingAt(wx1) < bayHeight) return false;
+    return true;
+}
+
+/*
+ * Main Compute Logic
+ * Core evaluation loop for the warehouse optimization strategy.
+ */
+
+void main() {
+    uint stratId = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    
+    int sweepDir = int(stratId % 4); 
+    // 0 = BL_TR, 1 = TR_BL, 2 = TL_BR, 3 = BR_TL
+    
+    int angleOffset = 0;
+    if (sweepDir == 0) angleOffset = 0;
+    else if (sweepDir == 1) angleOffset = 180;
+    else if (sweepDir == 2) angleOffset = 270;
+    else if (sweepDir == 3) angleOffset = 90;
+
+    // Initialization by thread 0
+    if (tid == 0) {
+        if (sweepDir == 0 || sweepDir == 3) sharedSearchFrom = 0;
+        else sharedSearchFrom = params.gridH - 1;
+        
+        results[stratId].totalPrice = 0.0;
+        results[stratId].totalLoads = 0.0;
+        results[stratId].usedArea = 0.0;
+        results[stratId].qScore = 1e30; // infinity
+        results[stratId].placementCount = 0;
+    }
+    
+    // Parallel copy of base grid to strategy grid (words)
+    int totalWords = (params.gridW * params.gridH + 3) / 4;
+    for (int i = int(tid); i < totalWords; i += 256) {
+        strategyGridsPacked[stratId * totalWords + i] = baseGridPacked[i];
+    }
+    
+    barrier();
+
+    const float kPi = 3.14159265358979323846;
+
+    while (true) {
+        // 1. Thread 0 finds next free cell
+        if (tid == 0) {
+            sharedFoundFreeCell = false;
+            if (sweepDir == 0) {
+                for (int y = sharedSearchFrom; y < params.gridH && !sharedFoundFreeCell; ++y) {
+                    for (int x = 0; x < params.gridW; ++x) {
+                        if (getGridCell(stratId, x, y) == kFree) {
+                            sharedGx = x; sharedGy = y; sharedFoundFreeCell = true; break;
+                        }
+                    }
+                }
+            } else if (sweepDir == 1) {
+                for (int y = sharedSearchFrom; y >= 0 && !sharedFoundFreeCell; --y) {
+                    for (int x = params.gridW - 1; x >= 0; --x) {
+                        if (getGridCell(stratId, x, y) == kFree) {
+                            sharedGx = x; sharedGy = y; sharedFoundFreeCell = true; break;
+                        }
+                    }
+                }
+            } else if (sweepDir == 2) {
+                for (int y = sharedSearchFrom; y >= 0 && !sharedFoundFreeCell; --y) {
+                    for (int x = 0; x < params.gridW; ++x) {
+                        if (getGridCell(stratId, x, y) == kFree) {
+                            sharedGx = x; sharedGy = y; sharedFoundFreeCell = true; break;
+                        }
+                    }
+                }
+            } else if (sweepDir == 3) {
+                for (int y = sharedSearchFrom; y < params.gridH && !sharedFoundFreeCell; ++y) {
+                    for (int x = params.gridW - 1; x >= 0; --x) {
+                        if (getGridCell(stratId, x, y) == kFree) {
+                            sharedGx = x; sharedGy = y; sharedFoundFreeCell = true; break;
+                        }
+                    }
+                }
+            }
+            
+            sharedBestScore = -1.0;
+            sharedBestTypeIdx = -1;
+        }
+        barrier();
+
+        if (!sharedFoundFreeCell) break;
+
+        float anchorX = gridToWorldX(sharedGx);
+        float anchorY = gridToWorldY(sharedGy);
+
+        // 2. Parallel evaluation
+        int totalChecks = params.numBayTypes * 360;
+        
+        double myBestScore = -1.0;
+        int myBestTypeIdx = -1;
+        float myBestAngle = 0.0;
+        OBB myBestSolid;
+        OBB myBestGap;
+        bool myHasGap = false;
+
+        for (int i = int(tid); i < totalChecks; i += 256) {
+            int rankOrderIdx = i / 360;
+            int typeIdx = rankedIndices[stratId * params.numBayTypes + rankOrderIdx];
+            int ai = i % 360;
+            int di = (ai + angleOffset) % 360;
+            
+            float deg = float(di);
+            float rad = deg * kPi / 180.0;
+            float c = cos(rad);
+            float s = sin(rad);
+
+            BayType type = bayTypes[typeIdx];
+            
+            OBB solid = buildOBB(anchorX, anchorY, type.width, type.depth, 0.0, c, s);
+            
+            if (!fitsSolidOBB(stratId, solid)) continue;
+            if (!ceilingClearsOBB(solid, type.height)) continue;
+
+            OBB gap;
+            bool gapPresent = (type.gap > 0.0);
+            if (gapPresent) {
+                gap = buildOBB(anchorX, anchorY, type.width, type.gap, type.depth, c, s);
+                if (!fitsGapOBB(stratId, gap)) continue;
+            }
+
+            // Valid placement!
+            // We want to minimize (rankOrderIdx * 360 + ai).
+            // Let's create a combined score: higher is better.
+            double score = 1000000.0 - double(rankOrderIdx * 360 + ai);
+            
+            if (score > myBestScore) {
+                myBestScore = score;
+                myBestTypeIdx = typeIdx;
+                myBestAngle = deg;
+                myBestSolid = solid;
+                myBestGap = gap;
+                myHasGap = gapPresent;
+            }
+        }
+
+        // 3. Reduction across the workgroup
+        int intScore = int(myBestScore);
+        if (tid == 0) sharedMaxScore = -1;
+        barrier();
+
+        if (intScore > -1) {
+            atomicMax(sharedMaxScore, intScore);
+        }
+        barrier();
+
+        if (intScore > -1 && intScore == sharedMaxScore) {
+            // Write best info (potential data race if multiple threads have exact same score, but they shouldn't since ai is unique)
+            sharedBestTypeIdx = myBestTypeIdx;
+            sharedBestAngle = myBestAngle;
+            sharedBestSolid = myBestSolid;
+            sharedBestGap = myBestGap;
+            sharedHasGap = myHasGap;
+        }
+        barrier();
+
+        // 4. Placement & Grid Update (Thread 0)
+        if (tid == 0) {
+            if (sharedBestTypeIdx == -1) {
+                // Mark cell as solid to skip it next time
+                setGridCell(stratId, sharedGx, sharedGy, kSolid);
+            } else {
+                int count = results[stratId].placementCount;
+                if (count < params.maxPlacementsPerStrategy) {
+                    BayType btype = bayTypes[sharedBestTypeIdx];
+                    
+                    float fxMin = sharedBestSolid.cx[0], fxMax = sharedBestSolid.cx[0];
+                    float fyMin = sharedBestSolid.cy[0], fyMax = sharedBestSolid.cy[0];
+                    for (int i = 1; i < 4; ++i) {
+                        fxMin = min(fxMin, sharedBestSolid.cx[i]);
+                        fxMax = max(fxMax, sharedBestSolid.cx[i]);
+                        fyMin = min(fyMin, sharedBestSolid.cy[i]);
+                        fyMax = max(fyMax, sharedBestSolid.cy[i]);
+                    }
+
+                    PlacedBay pb;
+                    pb.id = btype.id;
+                    pb.x = anchorX;
+                    pb.y = anchorY;
+                    pb.rotation = sharedBestAngle;
+                    pb.bayWidth = btype.width;
+                    pb.bayDepth = btype.depth;
+                    pb.height = btype.height;
+                    pb.gap = btype.gap;
+                    pb.footprintWidth = fxMax - fxMin;
+                    pb.footprintDepth = fyMax - fyMin;
+                    
+                    placements[stratId * params.maxPlacementsPerStrategy + count] = pb;
+                    results[stratId].placementCount = count + 1;
+
+                    results[stratId].totalPrice += btype.price;
+                    results[stratId].totalLoads += double(btype.nLoads);
+                    results[stratId].usedArea += double(btype.width) * double(btype.depth);
+
+                    markSolidOBB(stratId, sharedBestSolid);
+                    if (sharedHasGap) {
+                        markGapOBB(stratId, sharedBestGap);
+                    }
+                } else {
+                    // Out of buffer space, shouldn't happen for sensible sizes.
+                    setGridCell(stratId, sharedGx, sharedGy, kSolid);
+                }
+            }
+            sharedSearchFrom = sharedGy;
+        }
+        barrier();
+    }
+
+    // 5. Compute Q score (Thread 0)
+    if (tid == 0) {
+        double whArea = params.freeStartArea;
+        double pctArea = min(1.0, results[stratId].usedArea / whArea);
+        
+        if (results[stratId].totalLoads > 0.0) {
+            double base = results[stratId].totalPrice / results[stratId].totalLoads;
+            double exp = 2.0 - pctArea;
+            results[stratId].qScore = pow(base, exp);
+        } else {
+            results[stratId].qScore = 1e30;
+        }
+    }
+}
